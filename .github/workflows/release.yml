@@ -170,7 +170,7 @@ jobs:
 
   build-windows:
     name: Build · windows-x64
-    runs-on: windows-latest
+    runs-on: windows-2022
     if: github.event_name != 'workflow_dispatch' || !inputs.skip_windows
 
     steps:
@@ -184,13 +184,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-          key: cuda-12-windows-latest
+          key: cuda-12.6.0-windows-2022
 
       - name: Install CUDA toolkit
         if: steps.cache-cuda.outputs.cache-hit != 'true'
         uses: Jimver/cuda-toolkit@v0.2.30
         with:
-          log-file-suffix: 'windows-latest.txt'
+          log-file-suffix: 'windows-2022.txt'
 
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.2
