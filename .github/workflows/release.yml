@@ -197,11 +197,29 @@ jobs:
           cuda: '12.6.0'
           log-file-suffix: 'windows-2022.txt'
 
+      - name: Restore CUDA env from cache
+        if: steps.cache-cuda.outputs.cache-hit == 'true'
+        shell: pwsh
+        run: |
+          $cudaRoot = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6'
+          Add-Content $env:GITHUB_ENV "CUDA_PATH=$cudaRoot"
+          Add-Content $env:GITHUB_ENV "CUDA_PATH_V12_6=$cudaRoot"
+          Add-Content $env:GITHUB_PATH "$cudaRoot\bin"
+
       - name: Install Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@v1.2
-        with:
-          version: 1.4.309.0
-          cache: true
+        shell: pwsh
+        run: |
+          # humbletim/install-vulkan-sdk's 7z extract does not ship
+          # SPIRV-HeadersConfig.cmake on Windows; ggml needs it for
+          # find_package(SPIRV-Headers CONFIG). LunarG's official
+          # installer from 1.4.313.2+ does.
+          $ver = '1.4.313.2'
+          $installer = Join-Path $env:RUNNER_TEMP 'VulkanSDK-Installer.exe'
+          curl.exe -fL -o $installer "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkan-sdk.exe"
+          & $installer --accept-licenses --default-answer --confirm-command install
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$ver"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$ver\bin"
 
       - name: Cache build directory
         uses: actions/cache@v4
