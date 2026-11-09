@@ -54,6 +54,7 @@ jobs:
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.30
         with:
+          cuda: '12.6.0'
           log-file-suffix: 'ubuntu-22.04.txt'
 
       - name: Install Vulkan SDK
@@ -71,12 +72,9 @@ jobs:
         shell: bash
         run: |
           BIN="build"
-          "$BIN/mm-lm"         2>&1 | head -5
-          "$BIN/mm-synth"      2>&1 | head -5
-          "$BIN/mm-server" 2>&1 | head -5
-          "$BIN/neural-codec"   2>&1 | head -5
-          "$BIN/quantize"       2>&1 | head -3
-          "$BIN/"      2>&1 | head -3
+          for b in yue-plan yue-synth yue-server yue-tokenize yue-transcribe neural-codec quantize mp3-codec; do
+            "$BIN/$b" 2>&1 | head -5 || true
+          done
 
       - name: Resolve release tag
         id: tag
@@ -89,18 +87,19 @@ jobs:
           fi
 
       - name: Package binaries
+        shell: bash
         run: |
           mkdir -p dist
-          cp build/mm-* \
-             build/quantize build/build/ build/*.so dist/
-          tar -C dist -czf "minimaxmusic-linux-x64.tar.gz" .
+          shopt -s nullglob
+          cp -P build/yue-* build/neural-codec build/quantize build/mp3-codec build/*.so dist/
+          tar -C dist -czf "yue2-linux-x64.tar.gz" .
 
       - name: Upload to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ steps.tag.outputs.value }}" \
-            "minimaxmusic-linux-x64.tar.gz" \
+            "yue2-linux-x64.tar.gz" \
             --clobber
 
   build-mac:
@@ -125,19 +124,16 @@ jobs:
           mkdir build
           cd build
           cmake ..
-          cmake --build . --config Release -j "$(nproc)"
+          cmake --build . --config Release -j "$(sysctl -n hw.ncpu)"
 
       - name: Smoke test
         continue-on-error: true
         shell: bash
         run: |
           BIN="build"
-          "$BIN/mm-lm"         2>&1 | head -5
-          "$BIN/mm-synth"      2>&1 | head -5
-          "$BIN/mm-server" 2>&1 | head -5
-          "$BIN/neural-codec"   2>&1 | head -5
-          "$BIN/quantize"       2>&1 | head -3
-          "$BIN/"      2>&1 | head -3
+          for b in yue-plan yue-synth yue-server yue-tokenize yue-transcribe neural-codec quantize mp3-codec; do
+            "$BIN/$b" 2>&1 | head -5 || true
+          done
 
       - name: Resolve release tag
         id: tag
@@ -150,22 +146,30 @@ jobs:
           fi
 
       - name: Package binaries
+        shell: bash
         run: |
           mkdir -p dist
           cd build
-          for bin in mm-* quantize ; do
+          shopt -s nullglob
+          bins=(yue-* neural-codec quantize mp3-codec)
+          if [ ${#bins[@]} -eq 0 ]; then
+            echo "No release binaries found in build/" >&2
+            ls -la
+            exit 1
+          fi
+          for bin in "${bins[@]}"; do
             install_name_tool -add_rpath @executable_path "$bin"
           done
-          cp -P mm-* quantize  libggml*.dylib ../dist/
+          cp -P "${bins[@]}" libggml*.dylib ../dist/
           cd ..
-          tar -C dist -czf "minimaxmusic-macos-arm64-metal.tar.gz" .
+          tar -C dist -czf "yue2-macos-arm64-metal.tar.gz" .
 
       - name: Upload to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ steps.tag.outputs.value }}" \
-            "minimaxmusic-macos-arm64-metal.tar.gz" \
+            "yue2-macos-arm64-metal.tar.gz" \
             --clobber
 
   build-windows:
@@ -190,6 +194,7 @@ jobs:
         if: steps.cache-cuda.outputs.cache-hit != 'true'
         uses: Jimver/cuda-toolkit@v0.2.30
         with:
+          cuda: '12.6.0'
           log-file-suffix: 'windows-2022.txt'
 
       - name: Install Vulkan SDK
@@ -216,24 +221,23 @@ jobs:
             -DGGML_VULKAN=ON `
             -DGGML_BACKEND_DL=ON `
             --log-level=ERROR 2>&1 | Where-Object { $_ -notmatch '^--' }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # Build — suppress per-file progress, only show warnings/errors
           cmake --build build-msvc --config Release -j $env:NUMBER_OF_PROCESSORS `
             -- /v:minimal /consoleloggerparameters:ErrorsOnly 2>&1 `
             | Where-Object { $_ -match '(error|warning|FAILED|fatal)' -or $_ -eq '' } `
             | Select-Object -Last 50
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Smoke test
         continue-on-error: true
         shell: bash
         run: |
           BIN="build-msvc/Release"
-          "$BIN/mm-lm.exe"         2>&1 | head -5
-          "$BIN/mm-synth.exe"      2>&1 | head -5
-          "$BIN/mm-server.exe" 2>&1 | head -5
-          "$BIN/neural-codec.exe"   2>&1 | head -5
-          "$BIN/quantize.exe"       2>&1 | head -3
-          "$BIN/.exe"      2>&1 | head -3
+          for b in yue-plan yue-synth yue-server yue-tokenize yue-transcribe neural-codec quantize mp3-codec; do
+            "$BIN/$b.exe" 2>&1 | head -5 || true
+          done
 
       - name: Resolve release tag
         id: tag
@@ -248,10 +252,13 @@ jobs:
       - name: Package binaries
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path dist | Out-Null
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "build-msvc\Release\*.exe" dist\ -ErrorAction SilentlyContinue
           Copy-Item "build-msvc\Release\*.dll" dist\ -ErrorAction SilentlyContinue
-          Compress-Archive -Path dist\* -DestinationPath "minimaxmusic-windows-x64.zip"
+          if (-not (Get-ChildItem dist -File -ErrorAction SilentlyContinue)) {
+            throw "No binaries found under build-msvc\Release"
+          }
+          Compress-Archive -Path dist\* -DestinationPath "yue2-windows-x64.zip" -Force
 
       - name: Upload to release
         env:
@@ -259,5 +266,5 @@ jobs:
         shell: pwsh
         run: |
           gh release upload "${{ steps.tag.outputs.value }}" `
-            "minimaxmusic-windows-x64.zip" `
+            "yue2-windows-x64.zip" `
             --clobber
