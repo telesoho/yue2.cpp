@@ -202,9 +202,26 @@ jobs:
         shell: pwsh
         run: |
           $cudaRoot = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6'
+          if (-not (Test-Path "$cudaRoot\bin\nvcc.exe")) {
+            throw "CUDA cache hit but nvcc not found at $cudaRoot"
+          }
           Add-Content $env:GITHUB_ENV "CUDA_PATH=$cudaRoot"
           Add-Content $env:GITHUB_ENV "CUDA_PATH_V12_6=$cudaRoot"
           Add-Content $env:GITHUB_PATH "$cudaRoot\bin"
+
+          # Jimver/cuda-toolkit also installs CUDA MSBuild integration into
+          # Visual Studio. The toolkit cache does not include those VS files,
+          # so copy them from extras or MSBuild looks for "CUDA .props".
+          $src = Join-Path $cudaRoot 'extras\visual_studio_integration\MSBuildExtensions'
+          if (-not (Test-Path $src)) {
+            throw "CUDA VS integration not found at $src"
+          }
+          $dest = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022\*\MSBuild\Microsoft\VC\v170\BuildCustomizations' -Directory -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dest) {
+            throw "Visual Studio 2022 BuildCustomizations directory not found"
+          }
+          Copy-Item (Join-Path $src '*') $dest -Force
 
       - name: Install Vulkan SDK
         shell: pwsh
@@ -226,8 +243,6 @@ jobs:
         with:
           path: build-msvc
           key: build-msvc-${{ github.sha }}
-          restore-keys: |
-            build-msvc-
 
       - name: Configure & Build
         shell: pwsh
