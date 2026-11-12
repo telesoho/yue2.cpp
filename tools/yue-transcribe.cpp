@@ -5,6 +5,7 @@
 // symbols, melody-only keeps the vocal and instrumental voices alone.
 #include "audio-io.h"
 #include "backend.h"
+#include "notation-json.h"
 #include "sheetsage.h"
 #include "version.h"
 
@@ -27,6 +28,7 @@ static void print_usage(const char * prog) {
             "  --device <name>        Compute device: CUDA0, Vulkan0, MTL0, CPU...\n"
             "                         (default: best available)\n"
             "  --out <path>           Output score (default: score.abc)\n"
+            "  --json <path>          Output the ABC plus its real-time timeline as JSON\n"
             "  --melody-only          Omit the chord symbols from the score\n"
             "\n"
             "Debug:\n"
@@ -44,6 +46,7 @@ int main(int argc, char ** argv) {
     const char * device      = nullptr;
     const char * audio_path  = nullptr;
     const char * out_path    = "score.abc";
+    const char * json_path   = nullptr;
     const char * dump_dir    = nullptr;
     bool         melody_only = false;
     bool         no_fa       = false;
@@ -57,6 +60,8 @@ int main(int argc, char ** argv) {
             device = argv[++i];
         } else if (!strcmp(argv[i], "--out") && !last) {
             out_path = argv[++i];
+        } else if (!strcmp(argv[i], "--json") && !last) {
+            json_path = argv[++i];
         } else if (!strcmp(argv[i], "--melody-only")) {
             melody_only = true;
         } else if (!strcmp(argv[i], "--no-fa")) {
@@ -93,7 +98,8 @@ int main(int argc, char ** argv) {
     debug_init(&dbg, dump_dir);
 
     std::string abc, error;
-    bool        ok = ss2_transcribe(&m, audio.data(), (int) audio.size(), melody_only, &abc, &error, &dbg);
+    NotTimeline timeline;
+    bool        ok = ss2_transcribe_full(&m, audio.data(), (int) audio.size(), melody_only, &abc, &timeline, &error, &dbg);
     ss2_free(&m);
     if (!ok) {
         fprintf(stderr, "[Transcribe] FATAL: %s\n", error.empty() ? "transcription failed" : error.c_str());
@@ -105,6 +111,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
     fclose(f);
+    if (json_path) {
+        std::string json = notation_json(abc, timeline);
+        f                = fopen(json_path, "wb");
+        if (!f || fwrite(json.data(), 1, json.size(), f) != json.size()) {
+            fprintf(stderr, "[Transcribe] FATAL: cannot write %s\n", json_path);
+            return 1;
+        }
+        fclose(f);
+    }
     fprintf(stderr, "[Transcribe] Done: %s -> %s\n", audio_path, out_path);
     return 0;
 }

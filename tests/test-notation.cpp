@@ -10,6 +10,7 @@
 // Pure CPU: notation.h only needs the standard library.
 
 #include "notation.h"
+#include "notation-json.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -144,6 +145,194 @@ static void mixed_meter_span_is_kept() {
     expect_span(measures[1], 4, 8, "mixed span unchanged");
 }
 
+// A four measure 4/4 song at 120 BPM with two voices: the vocal on every one
+// of the first eight beats, the instrumental on every fourth. One extra note
+// is shorter than a MIDI tick, so it becomes no ABC note and must not show up
+// in the timeline either.
+static std::vector<NotEvent> song_events() {
+    std::vector<NotEvent> events;
+    for (int bar = 0; bar < 4; bar++) {
+        for (int beat = 0; beat < 4; beat++) {
+            int      index = bar * 4 + beat;
+            NotEvent e;
+            e.time           = 0.5 * index;
+            e.subbeat        = 0;
+            e.global_subbeat = index;
+            e.has_meter      = true;
+            e.meter_num      = 4;
+            e.meter_den      = 4;
+            e.eighth         = beat * 2;
+            if (index == 0) {
+                e.key       = "C:maj";
+                e.chord     = "C:maj";
+                e.structure = "verse";
+            }
+            events.push_back(e);
+        }
+    }
+    for (int index = 0; index < 8; index++) {
+        events[(size_t) index].melody.push_back({ 60 + index, 0, 1, events[(size_t) index].time + 0.4 });
+    }
+    for (int index : { 2, 6, 10, 14 }) {
+        events[(size_t) index].melody.push_back({ 48, 1, 1, events[(size_t) index].time + 0.4 });
+    }
+    // Shorter than the 1920 tick round trip: dropped by the ABC, dropped here
+    events[9].melody.push_back({ 62, 0, 1, events[9].time + 0.0001 });
+    return events;
+}
+
+// The real-time timeline describes the same transcription as the ABC: one
+// note per ABC onset of each voice, the same beats and measures, the
+// intervals in the song domain.
+static void timeline_matches_the_score() {
+    const double duration = 8.0;
+    NotTables    tables;
+    tables.key_abc["C:maj"]   = "C";
+    tables.chord_abc["C:maj"] = "C";
+
+    std::vector<NotEvent> events = song_events();
+    NotScore              score;
+    NotTimeline           timeline;
+    std::string           error;
+    if (!notation_build(events, duration, tables, false, &score, &timeline, &error)) {
+        fprintf(stderr, "[Test-Notation] FAIL: notation_build: %s\n", error.c_str());
+        exit(1);
+    }
+
+    expect(timeline.duration == duration, "timeline duration is the song duration");
+    expect(score.beats.size() == timeline.beats.size(), "timeline beat count matches the score");
+    for (size_t i = 0; i < timeline.beats.size(); i++) {
+        expect(timeline.beats[i].time == score.beats[i].time, "timeline beat time matches the score");
+        expect(timeline.beats[i].beat_id == score.beats[i].beat_id, "timeline beat id matches the score");
+    }
+    expect(timeline.beats.size() > 1, "timeline carries the extended beats");
+    for (size_t i = 1; i < timeline.beats.size(); i++) {
+        expect(timeline.beats[i].time > timeline.beats[i - 1].time, "timeline beats are strictly increasing");
+    }
+
+    // Measures index the beats array and tile it
+    expect(timeline.measures.size() == score.measures.size(), "timeline measure count matches the score");
+    expect(!timeline.measures.empty(), "timeline carries measures");
+    for (size_t i = 0; i < timeline.measures.size(); i++) {
+        const NotMeasure & m = timeline.measures[i];
+        expect(m.start_beat >= 0 && m.end_beat > m.start_beat, "measure span is positive");
+        expect((size_t) m.end_beat < timeline.beats.size(), "measure span stays inside the beats");
+        expect(m.denominator > 0 && m.numerator > 0, "measure meter is positive");
+        expect(m.abc_denominator > 0 && m.abc_numerator > 0, "measure notated meter is positive");
+        if (i > 0) {
+            expect(m.start_beat == timeline.measures[i - 1].end_beat, "measures tile the beats");
+        }
+    }
+
+    // One timeline note per ABC onset of each voice, in the same order
+    int total = 0;
+    for (int track = 0; track < 2; track++) {
+        int abc_notes = 0;
+        for (int v : score.voice[track]) {
+            if (v > 0 && (v % 2) == 1) {
+                abc_notes++;
+            }
+        }
+        int    timeline_notes = 0;
+        double last_start     = -1.0;
+        for (const NotTimelineNote & n : timeline.notes) {
+            if (n.track != track) {
+                continue;
+            }
+            timeline_notes++;
+            expect(n.end > n.start, "timeline note has a positive span");
+            expect(n.start >= 0.0 && n.end <= duration + 1e-9, "timeline note stays inside the song");
+            expect(n.start > last_start, "timeline notes of a voice are strictly ordered");
+            last_start = n.start;
+        }
+        expect(timeline_notes == abc_notes, "timeline note count matches the ABC voice");
+        total += abc_notes;
+    }
+    expect(total == 12, "the song has twelve notatable notes");
+    expect((int) timeline.notes.size() == total, "the tick-collapsed note is dropped from the timeline");
+
+    // The interval fields, in real seconds
+    expect(timeline.keys.size() == 1 && timeline.keys[0].label == "C", "timeline key is the ABC spelling");
+    expect(timeline.keys[0].start == 0.0 && timeline.keys[0].end == duration, "key spans the song");
+    expect(timeline.chords.size() == 1 && timeline.chords[0].label == "C:maj", "timeline chord keeps its label");
+    expect(timeline.sections.size() == 1 && timeline.sections[0].label == "verse", "timeline section keeps its label");
+    for (const NotInterval & r : timeline.keys) {
+        expect(r.end > r.start, "timeline interval has a positive span");
+    }
+
+    // The ABC is untouched by the timeline request
+    std::string abc;
+    expect(notation_abc(events, duration, tables, false, &abc, &error), "ABC still renders");
+    expect(abc.find("V: Vocal") != std::string::npos, "ABC carries the vocal voice");
+    expect(abc.find("V: Ins") != std::string::npos, "ABC carries the instrumental voice");
+}
+
+// The JSON the server and the CLI emit carries the ABC and the timeline in
+// one object, with the field names the clients read.
+static void timeline_json_has_the_schema() {
+    const double duration = 8.0;
+    NotTables    tables;
+    tables.key_abc["C:maj"]   = "C";
+    tables.chord_abc["C:maj"] = "C";
+
+    std::vector<NotEvent> events = song_events();
+    NotScore              score;
+    NotTimeline           timeline;
+    std::string           error;
+    expect(notation_build(events, duration, tables, false, &score, &timeline, &error), "timeline build for JSON");
+    std::string abc;
+    expect(notation_abc(events, duration, tables, false, &abc, &error), "ABC build for JSON");
+
+    std::string json = notation_json(abc, timeline);
+    yyjson_doc * doc = yyjson_read(json.c_str(), json.size(), 0);
+    if (!doc) {
+        fprintf(stderr, "[Test-Notation] FAIL: emitted JSON does not parse\n");
+        exit(1);
+    }
+    yyjson_val * root = yyjson_doc_get_root(doc);
+    expect(yyjson_is_obj(root) != 0, "timeline JSON is an object");
+    expect(yyjson_is_str(yyjson_obj_get(root, "abc")) != 0, "timeline JSON carries the ABC");
+    yyjson_val * dur = yyjson_obj_get(root, "duration");
+    expect(yyjson_is_num(dur) != 0 && std::fabs(yyjson_get_real(dur) - duration) < 1e-9,
+           "timeline JSON carries the duration");
+
+    yyjson_val * notes = yyjson_obj_get(root, "notes");
+    expect(yyjson_is_arr(notes) != 0 && yyjson_arr_size(notes) == timeline.notes.size(), "timeline JSON notes");
+    yyjson_val * note = yyjson_arr_get_first(notes);
+    expect(yyjson_is_obj(note) != 0, "timeline JSON note is an object");
+    for (const char * field : { "start", "end", "pitch", "track" }) {
+        expect(yyjson_obj_get(note, field) != nullptr, "timeline JSON note field");
+    }
+
+    yyjson_val * beats = yyjson_obj_get(root, "beats");
+    expect(yyjson_is_arr(beats) != 0 && yyjson_arr_size(beats) == timeline.beats.size(), "timeline JSON beats");
+    yyjson_val * beat = yyjson_arr_get_first(beats);
+    for (const char * field : { "time", "beat_id", "num", "den" }) {
+        expect(yyjson_obj_get(beat, field) != nullptr, "timeline JSON beat field");
+    }
+
+    yyjson_val * measures = yyjson_obj_get(root, "measures");
+    expect(yyjson_is_arr(measures) != 0 && yyjson_arr_size(measures) == timeline.measures.size(),
+           "timeline JSON measures");
+    yyjson_val * measure = yyjson_arr_get_first(measures);
+    for (const char * field : { "start_beat", "end_beat", "start", "end", "numerator", "denominator",
+                                "abc_numerator", "abc_denominator", "pad_before" }) {
+        expect(yyjson_obj_get(measure, field) != nullptr, "timeline JSON measure field");
+    }
+
+    const char * interval_keys[3] = { "keys", "chords", "sections" };
+    for (const char * key : interval_keys) {
+        yyjson_val * arr = yyjson_obj_get(root, key);
+        expect(yyjson_is_arr(arr) != 0, "timeline JSON interval array");
+        yyjson_val * interval = yyjson_arr_get_first(arr);
+        expect(yyjson_is_obj(interval) != 0, "timeline JSON interval is an object");
+        for (const char * field : { "start", "end", "label" }) {
+            expect(yyjson_obj_get(interval, field) != nullptr, "timeline JSON interval field");
+        }
+    }
+    yyjson_doc_free(doc);
+}
+
 int main() {
     clean_4_4_is_untouched();
     early_downbeat_is_rebarred();
@@ -151,6 +340,8 @@ int main() {
     pickup_is_padded();
     waltz_stays_three();
     mixed_meter_span_is_kept();
+    timeline_matches_the_score();
+    timeline_json_has_the_schema();
     fprintf(stderr, "[Test-Notation] ok\n");
     return 0;
 }

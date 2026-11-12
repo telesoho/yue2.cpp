@@ -97,6 +97,12 @@ pip install hf gguf numpy
 server.cmd        # Windows
 ```
 
+Reading a score needs no backbone: start the server with only
+`--transcriber <SheetSage2.gguf>` (with the same-precision MERT GGUF beside
+it) and `/transcribe` works. The backbone GGUF and the VAE are only needed
+for song generation and the `/vae` routes; `--model` and `--vae` are
+optional, at least one capability must be supplied.
+
 Open http://localhost:8087 in your browser. The WebUI handles everything:
 write style tags and lyrics, generate, read the score the model composed,
 play and download tracks. Open an MP3 or WAV to get it on a card, then
@@ -161,17 +167,21 @@ at 5.8 GB at the full context and 3.8 GB at `--max-seq 8192`.
 ## Server options
 
 ```
-Usage: ./yue-server --model <gguf> --vae <gguf> [options]
+Usage: ./yue-server [options]
 
-Required:
-  --model <gguf>         Backbone GGUF
-  --vae <gguf>           VAE GGUF
+At least one capability is required: --transcriber reads scores,
+--tokenizer writes audio codes, --model with --vae generates songs.
+Score reading needs only --transcriber.
+
+Models:
+  --model <gguf>         Backbone GGUF, enables /synth (with --vae)
+  --vae <gguf>           VAE GGUF, enables /vae and song generation
+  --transcriber <gguf>   SheetSage2 GGUF, MERT beside it, enables /transcribe
+  --tokenizer <gguf>     Audio tokenizer GGUF, MERT beside it, enables /tokenize
 
 Optional:
   --device <name>        Compute device: CUDA0, Vulkan0, MTL0, CPU...
                          (default: best available)
-  --transcriber <gguf>   SheetSage2 GGUF, MERT beside it, enables /transcribe
-  --tokenizer <gguf>     Audio tokenizer GGUF, MERT beside it, enables /tokenize
   --adapters <dir>       Directory of LoRA adapters a request can stack
   --host <addr>          Listen address (default: 0.0.0.0)
   --port <N>             Listen port (default: 8087)
@@ -203,9 +213,47 @@ request). `lm_batch_size` songs times `synth_batch_size` noise variations
 come out song-major.
 **POST /job?id=N&cancel=1** cancels a running job.
 
+**POST /transcribe** - multipart/form-data with an `audio` part (WAV or
+MP3) and an optional `melody_only` field. Served when the server was
+started with `--transcriber`; needs no backbone. The job result is one JSON
+object:
+
+```json
+{
+  "abc": "X:1\n...",
+  "duration": 212.4,
+  "notes":    [{ "start": 0.0, "end": 0.48, "pitch": 60, "track": 0 }],
+  "beats":    [{ "time": 0.0, "beat_id": 1, "num": 4, "den": 4 }],
+  "measures": [{ "start_beat": 0, "end_beat": 4, "start": 0.0, "end": 2.0,
+                 "numerator": 4, "denominator": 4,
+                 "abc_numerator": 4, "abc_denominator": 4, "pad_before": false }],
+  "keys":     [{ "start": 0.0, "end": 212.4, "label": "C" }],
+  "chords":   [{ "start": 0.0, "end": 212.4, "label": "C:maj" }],
+  "sections": [{ "start": 0.0, "end": 212.4, "label": "verse" }]
+}
+```
+
+The times are the real seconds the transcriber heard, not the quantized ABC
+grid. Track 0 is the vocal voice, 1 the instrumental one; filter `notes` by
+track and index i is the i-th note of that ABC voice, so lyrics align to
+real note times instead of ABC plus one global tempo. The measures index
+the `beats` array through `start_beat`/`end_beat` and repeat the span in
+seconds.
+
+**POST /tokenize** - multipart/form-data with an `audio` part; served when
+started with `--tokenizer`, needs no backbone. The job result is
+`{"codes": "..."}`.
+
+**POST /vae** - multipart/form-data with exactly one of an `audio` part
+(encode, latents out) or a `src_latents` part (decode, audio out); served
+when started with `--vae`. Without the models a POST returns 503 JSON
+instead of crashing.
+
 **GET /health** - Returns `{"status":"ok"}`.
 
-**GET /props** - Server version, model paths, frame rate, context, and the
+**GET /props** - Server version, model paths, frame rate, context, the
+`capabilities` array of the routes this instance can actually serve
+(`synth`, `vae`, `transcribe`, `transcribe-timeline`, `tokenize`), and the
 default request parameters.
 
 **GET /logs** - SSE stream of server stderr.
@@ -250,6 +298,14 @@ instrumental voices alone, which is what `cot` `melody` expects.
 
 ```bash
 ./build/yue-transcribe --model models/SheetSage2-Q8_0.gguf --audio song.mp3 --out score.abc
+```
+
+`--json <path>` writes the same object `/transcribe` returns: the ABC plus
+the real-time note, beat, measure and interval timeline, so a host app can
+align lyrics to the times actually heard.
+
+```bash
+./build/yue-transcribe --model models/SheetSage2-Q8_0.gguf --audio song.mp3 --out score.abc --json score.json
 ```
 
 The `yue-tokenize` tool runs the audio tokenizer on a recording and writes

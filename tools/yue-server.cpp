@@ -13,6 +13,7 @@
 #include "backend.h"
 #include "httplib.h"
 #include "index.html.gz.hpp"
+#include "notation-json.h"
 #include "pipeline.h"
 #include "version.h"
 #include "yyjson.h"
@@ -466,6 +467,24 @@ static void handle_props(const httplib::Request &, httplib::Response & res) {
     yyjson_mut_obj_add_int(doc, root, "frame_rate", YUE2_FRAME_RATE);
     yyjson_mut_obj_add_int(doc, root, "context", YUE2_CONTEXT);
 
+    // The routes this instance can serve: a score reader started without the
+    // backbone stays honest about synthesis instead of failing a job
+    yyjson_mut_val * capabilities = yyjson_mut_arr(doc);
+    if (pipeline_can_synth(&g_pipeline)) {
+        yyjson_mut_arr_add_str(doc, capabilities, "synth");
+    }
+    if (pipeline_can_vae(&g_pipeline)) {
+        yyjson_mut_arr_add_str(doc, capabilities, "vae");
+    }
+    if (!g_transcriber_path.empty()) {
+        yyjson_mut_arr_add_str(doc, capabilities, "transcribe");
+        yyjson_mut_arr_add_str(doc, capabilities, "transcribe-timeline");
+    }
+    if (!g_tokenizer_path.empty()) {
+        yyjson_mut_arr_add_str(doc, capabilities, "tokenize");
+    }
+    yyjson_mut_obj_add_val(doc, root, "capabilities", capabilities);
+
     // The adapter directory, each entry with the halves it changes
     yyjson_mut_val * adapters = yyjson_mut_arr(doc);
     for (const AdapterEntry & e : g_pipeline.adapters) {
@@ -550,21 +569,24 @@ static bool validate(const std::string & json, httplib::Response & res, Yue2Requ
     return true;
 }
 
-// Transcribe worker: the uploaded recording becomes an ABC score, the chord
-// symbols dropped when only the melody is wanted.
+// Transcribe worker: the uploaded recording becomes an ABC score plus the
+// real-time timeline of the same transcription, the chord symbols dropped
+// when only the melody is wanted.
 static void run_transcribe(std::shared_ptr<Job> job, std::vector<float> audio, bool melody_only) {
     active_job_set(job);
     fprintf(stderr, "[Server] Transcribe job %s: %.1f s of audio, %s\n", job->id.c_str(),
             (double) audio.size() / MERT_SAMPLE_RATE, melody_only ? "melody only" : "full score");
     std::string abc, error;
-    bool        ok = pipeline_transcribe(&g_pipeline, audio.data(), (int) audio.size(), melody_only, &abc, &error);
+    NotTimeline timeline;
+    bool        ok =
+        pipeline_transcribe(&g_pipeline, audio.data(), (int) audio.size(), melody_only, &abc, &error, &timeline);
     active_job_set(nullptr);
     if (!ok) {
         fprintf(stderr, "[Server] Transcribe job %s failed: %s\n", job->id.c_str(), error.c_str());
         job->status.store(job->cancel.load() ? JobStatus::CANCELLED : JobStatus::FAILED);
         return;
     }
-    job->result_body = json_string("abc", abc);
+    job->result_body = notation_json(abc, timeline);
     job->result_mime = "application/json";
     job->status.store(JobStatus::DONE);
 }
@@ -699,17 +721,21 @@ static void run_job(std::shared_ptr<Job> job, Yue2Request request) {
 static void print_usage(const char * prog) {
     fprintf(stderr, "yue2.cpp %s\n\n", YUE2_VERSION);
     fprintf(stderr,
-            "Usage: %s --model <gguf> --vae <gguf> [options]\n"
+            "Usage: %s [options]\n"
             "\n"
-            "Required:\n"
-            "  --model <gguf>         Backbone GGUF\n"
-            "  --vae <gguf>           VAE GGUF\n"
+            "At least one capability is required: --transcriber reads scores,\n"
+            "--tokenizer writes audio codes, --model with --vae generates songs.\n"
+            "Score reading needs only --transcriber.\n"
+            "\n"
+            "Models:\n"
+            "  --model <gguf>         Backbone GGUF, enables /synth (with --vae)\n"
+            "  --vae <gguf>           VAE GGUF, enables /vae and song generation\n"
+            "  --transcriber <gguf>   SheetSage2 GGUF, MERT beside it, enables /transcribe\n"
+            "  --tokenizer <gguf>     Audio tokenizer GGUF, MERT beside it, enables /tokenize\n"
             "\n"
             "Optional:\n"
             "  --device <name>        Compute device: CUDA0, Vulkan0, MTL0, CPU...\n"
             "                         (default: best available)\n"
-            "  --transcriber <gguf>   SheetSage2 GGUF, MERT beside it, enables /transcribe\n"
-            "  --tokenizer <gguf>     Audio tokenizer GGUF, MERT beside it, enables /tokenize\n"
             "  --adapters <dir>       Directory of LoRA adapters a request can stack\n"
             "  --host <addr>          Listen address (default: 0.0.0.0)\n"
             "  --port <N>             Listen port (default: 8087)\n"
@@ -777,9 +803,12 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (g_model_path.empty() || g_vae_path.empty()) {
+    if (g_model_path.empty() && g_vae_path.empty() && g_transcriber_path.empty() && g_tokenizer_path.empty()) {
         print_usage(argv[0]);
         return 1;
+    }
+    if (g_model_path.empty() != g_vae_path.empty()) {
+        fprintf(stderr, "[Server] WARNING: synthesis needs both --model and --vae; /synth stays unavailable\n");
     }
     if (device && !backend_set_device(device)) {
         print_usage(argv[0]);
@@ -829,6 +858,12 @@ int main(int argc, char ** argv) {
     svr.Get("/logs", handle_logs);
 
     svr.Post("/synth", [](const httplib::Request & req, httplib::Response & res) {
+        if (!pipeline_can_synth(&g_pipeline)) {
+            res.status = 503;
+            res.set_content(json_string("error", "synthesis unavailable: start yue-server with --model and --vae"),
+                            "application/json");
+            return;
+        }
         Yue2Request request;
         if (!validate(req.body, res, &request)) {
             return;
@@ -894,6 +929,11 @@ int main(int argc, char ** argv) {
     // output format, peak clip and bitrate drive the decode. The result
     // carries the other side alone, the client holds the one it sent.
     svr.Post("/vae", [](const httplib::Request & req, httplib::Response & res) {
+        if (!pipeline_can_vae(&g_pipeline)) {
+            res.status = 503;
+            res.set_content(json_string("error", "VAE unavailable: start yue-server with --vae"), "application/json");
+            return;
+        }
         bool has_audio   = req.is_multipart_form_data() && req.form.has_file("audio");
         bool has_latents = req.is_multipart_form_data() && req.form.has_file("src_latents");
         if (has_audio == has_latents) {

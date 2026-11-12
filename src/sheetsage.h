@@ -1074,17 +1074,19 @@ static std::vector<int> ss2_overlap_prefix(const SS2Tokenizer &          t,
     return out;
 }
 
-// Transcribe a whole song: 24 kHz mono samples -> ABC. Windows of the model
-// length with the overlap and lookahead of the reference, each window
-// prefixed with the events of the overlap, the accepted events stitched in
-// time order, then the notation. melody_only drops the chords.
-static bool ss2_transcribe(SheetSage2 *        m,
-                           const float *       audio,
-                           int                 n_samples,
-                           bool                melody_only,
-                           std::string *       abc,
-                           std::string *       error,
-                           const DebugDumper * dbg) {
+// Transcribe a whole song: 24 kHz mono samples -> ABC, and when asked for it
+// the real-time timeline of the same score. Windows of the model length with
+// the overlap and lookahead of the reference, each window prefixed with the
+// events of the overlap, the accepted events stitched in time order, then
+// the notation. melody_only drops the chords.
+static bool ss2_transcribe_full(SheetSage2 *        m,
+                                const float *       audio,
+                                int                 n_samples,
+                                bool                melody_only,
+                                std::string *       abc,
+                                NotTimeline *       timeline,
+                                std::string *       error,
+                                const DebugDumper * dbg) {
     const SS2Config & c         = m->cfg;
     const double      length    = c.window_seconds;
     const double      overlap   = 200.0;
@@ -1172,8 +1174,22 @@ static bool ss2_transcribe(SheetSage2 *        m,
         accepted = accept_end;
         start    = std::min(start + (length - overlap), duration - length);
     }
-    bool ok = notation_abc(stitched, duration, m->tok.tables, melody_only, abc, error);
+    NotScore score;
+    bool     ok = notation_build(stitched, duration, m->tok.tables, melody_only, &score, timeline, error);
+    if (ok) {
+        ok = not_score_to_abc(score, abc, error);
+    }
     fprintf(stderr, "[SheetSage] Transcribed: %.1f s of audio, %zu events, %.1f s%s\n", duration, stitched.size(),
             total.ms() / 1000.0, ok ? "" : ", no score");
     return ok;
+}
+
+static bool ss2_transcribe(SheetSage2 *        m,
+                           const float *       audio,
+                           int                 n_samples,
+                           bool                melody_only,
+                           std::string *       abc,
+                           std::string *       error,
+                           const DebugDumper * dbg) {
+    return ss2_transcribe_full(m, audio, n_samples, melody_only, abc, nullptr, error, dbg);
 }

@@ -1,6 +1,8 @@
-# test-notation: measure inference from decoded beats, pure CPU, no ggml.
+# test-notation: measure inference from decoded beats and the real-time
+# timeline, pure CPU, no ggml. The JSON writer needs yyjson.
 add_executable(test-notation test-notation.cpp)
 target_include_directories(test-notation PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-notation PRIVATE yyjson)
 
 # test-vae: Oobleck VAE decoder parity harness against the torch reference.
 add_executable(test-vae test-vae.cpp)

@@ -1,4 +1,7 @@
 build/
+build-local/
+build-msvc/
+build-vulkan/
 *.wav
 
 tests/*/

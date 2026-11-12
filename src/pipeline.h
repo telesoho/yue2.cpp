@@ -67,8 +67,18 @@ struct Yue2Pipeline {
     // and to the shared backend, held for the process lifetime
     Qw3lmKvCache kv;
     BackendPair  kv_backend;
-    bool         configured = false;
+    bool         configured = false;  // backbone BPE + KV cache initialized
 };
+
+// What the configured paths can serve: synthesis needs both halves of the
+// backbone, the VAE routes only the VAE, score reading neither.
+static bool pipeline_can_synth(const Yue2Pipeline * p) {
+    return !p->model_path.empty() && !p->vae_path.empty();
+}
+
+static bool pipeline_can_vae(const Yue2Pipeline * p) {
+    return !p->vae_path.empty();
+}
 
 struct Yue2Song {
     std::string        score;      // ABC of the plan, empty in off mode
@@ -112,15 +122,43 @@ static std::string pipeline_format_tokens(const std::vector<int> & tokens) {
     return csv;
 }
 
+// The backbone half of the configuration: the BPE table and the KV cache
+// sized from the GGUF config. Lazy, so a server that only reads scores never
+// pays for it, and skipped entirely when no backbone path is given.
+static bool pipeline_backbone_ready(Yue2Pipeline * p) {
+    if (p->configured) {
+        return true;
+    }
+    if (p->model_path.empty()) {
+        return false;
+    }
+    if (!store_bpe(p->store, p->model_path.c_str())) {
+        return false;
+    }
+    Qwen3LMConfig cfg;
+    if (!qw3lm_read_config(p->model_path.c_str(), &cfg)) {
+        return false;
+    }
+    if (p->params.max_seq > 0) {
+        cfg.max_seq_len = p->params.max_seq;
+    }
+    p->kv_backend = backend_init("KV");
+    qw3lm_kv_init(&p->kv, cfg, p->kv_backend.backend);
+    p->configured = true;
+    return true;
+}
+
 // Record the paths and the knobs, load the tokenizer, read the backbone
 // config the cache is sized from. No GPU module loads here, the first
-// generate requires them and allocates the cache.
+// generate requires them and allocates the cache. Both model paths are
+// optional: without them the server reads scores and tokenizes but cannot
+// synthesize, and nothing backbone-shaped is initialized.
 static bool pipeline_configure(Yue2Pipeline *             p,
                                const char *               model_path,
                                const char *               vae_path,
                                const Yue2PipelineParams & params) {
-    p->model_path = model_path;
-    p->vae_path   = vae_path;
+    p->model_path = model_path ? model_path : "";
+    p->vae_path   = vae_path ? vae_path : "";
     p->params     = params;
     debug_init(&p->dumper, params.dump_dir);
     if (params.no_fa) {
@@ -129,24 +167,18 @@ static bool pipeline_configure(Yue2Pipeline *             p,
     if (params.clamp_fp16) {
         fprintf(stderr, "[Pipeline] FP16 clamp enabled\n");
     }
-    if (!store_bpe(p->store, model_path)) {
-        return false;
-    }
     if (params.adapters_dir) {
         p->adapters = adapter_scan(params.adapters_dir);
     }
-
-    Qwen3LMConfig cfg;
-    if (!qw3lm_read_config(model_path, &cfg)) {
-        return false;
+    if (p->model_path.empty()) {
+        if (p->vae_path.empty()) {
+            fprintf(stderr, "[Pipeline] No backbone model: song generation and /vae are unavailable\n");
+        } else {
+            fprintf(stderr, "[Pipeline] No backbone model: song generation unavailable, /vae stays enabled\n");
+        }
+        return true;
     }
-    if (params.max_seq > 0) {
-        cfg.max_seq_len = params.max_seq;
-    }
-    p->kv_backend = backend_init("KV");
-    qw3lm_kv_init(&p->kv, cfg, p->kv_backend.backend);
-    p->configured = true;
-    return true;
+    return pipeline_backbone_ready(p);
 }
 
 static void pipeline_free(Yue2Pipeline * p) {
@@ -299,21 +331,23 @@ static SheetSage2 * require_ss2(Yue2Pipeline * p) {
 }
 
 // A recording to its ABC score, the chord symbols dropped when only the
-// melody is wanted. The transcriber holds the GPU for the call and steps
+// melody is wanted, and the real-time timeline of the same score when the
+// caller asks for it. The transcriber holds the GPU for the call and steps
 // aside after it like the other stages.
 static bool pipeline_transcribe(Yue2Pipeline * p,
                                 const float *  audio,
                                 int            n_samples,
                                 bool           melody_only,
                                 std::string *  abc,
-                                std::string *  error) {
+                                std::string *  error,
+                                NotTimeline *  timeline = nullptr) {
     SheetSage2 * m = require_ss2(p);
     if (!m) {
         *error = "transcriber unavailable";
         return false;
     }
     ModelHandle hold(p->store, m);
-    return ss2_transcribe(m, audio, n_samples, melody_only, abc, error, &p->dumper);
+    return ss2_transcribe_full(m, audio, n_samples, melody_only, abc, timeline, error, &p->dumper);
 }
 
 // A recording to its semantic codes, the stream a replay renders. The
@@ -421,6 +455,10 @@ static bool pipeline_generate(Yue2Pipeline *          p,
                               std::vector<Yue2Song> * songs,
                               bool (*cancelled)(void *) = nullptr,
                               void * cancel_data        = nullptr) {
+    if (!pipeline_backbone_ready(p)) {
+        fprintf(stderr, "[Pipeline] FATAL: no backbone model configured, cannot synthesize\n");
+        return false;
+    }
     Timer   total_timer;
     Yue2Cot cot;
     if (!yue2_cot_parse(r.cot, &cot)) {

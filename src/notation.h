@@ -81,7 +81,30 @@ struct NotScore {
     std::vector<std::string>                 chord_arr;  // chord label per subbeat, "N" for none
     std::vector<std::pair<int, std::string>> structure_events;
     std::vector<int>                         voice[2];   // 0 rest, pitch * 2 + 2 sustain, + 1 onset
-    const NotTables *                        tables;
+    const NotTables *                        tables = nullptr;
+};
+
+// One note of the real-time timeline, in seconds from the start of the
+// recording. Track 0 is the vocal voice, 1 the instrumental one.
+struct NotTimelineNote {
+    double start, end;
+    int    pitch, track;
+};
+
+// The real-time side of the decoded score: the notes as they were heard, not
+// as they were quantized onto the ABC subbeat grid, so a host app can align
+// lyrics to the times the transcriber reports. The notes keep the order of
+// the cleaned notes that become the ABC voices: filter by track and index i
+// is the i-th note of that voice. The measures index the beats array, the
+// intervals are clipped to [0, duration].
+struct NotTimeline {
+    std::vector<NotTimelineNote> notes;
+    std::vector<NotBeat>         beats;     // real seconds
+    std::vector<NotMeasure>      measures;  // beat indices into beats
+    std::vector<NotInterval>     keys;      // ABC key spelling, real seconds
+    std::vector<NotInterval>     chords;    // tokenizer chord label, real seconds
+    std::vector<NotInterval>     sections;  // structure label, real seconds
+    double                       duration = 0.0;
 };
 
 static bool not_fail(std::string * error, const std::string & message) {
@@ -754,13 +777,20 @@ static bool not_score_to_abc(const NotScore & s, std::string * abc, std::string 
     return true;
 }
 
-// The whole export: events of a song -> ABC text, or the reason there is none
-static bool notation_abc(const std::vector<NotEvent> & events,
-                         double                        duration,
-                         const NotTables &             tables,
-                         bool                          melody_only,
-                         std::string *                 abc,
-                         std::string *                 error) {
+// The whole export: events of a song -> the decoded score (the quantized
+// subbeat grid ABC is written on) and, when asked for, the real-time timeline
+// of the same events, or the reason there is none. notation_abc() renders the
+// score as ABC.
+static bool notation_build(const std::vector<NotEvent> & events,
+                           double                        duration,
+                           const NotTables &             tables,
+                           bool                          melody_only,
+                           NotScore *                    s_out,
+                           NotTimeline *                 timeline,
+                           std::string *                 error) {
+    if (timeline) {
+        *timeline = NotTimeline{};
+    }
     // Notes, clipped to the song
     struct Note {
         double start, end;
@@ -829,9 +859,13 @@ static bool notation_abc(const std::vector<NotEvent> & events,
     }
 
     // Intervals clipped to the beat domain, the key in ABC spelling
+    std::vector<NotInterval> raw[3];
+    for (int f = 0; f < 3; f++) {
+        raw[f] = not_intervals(events, f, duration);
+    }
     std::vector<NotInterval> fields[3];
     for (int f = 0; f < 3; f++) {
-        for (NotInterval r : not_intervals(events, f, duration)) {
+        for (NotInterval r : raw[f]) {
             if (r.end > beats.front().time && r.start < beats.back().time) {
                 r.start = std::max(beats.front().time, r.start);
                 r.end   = std::min(beats.back().time, r.end);
@@ -839,7 +873,7 @@ static bool notation_abc(const std::vector<NotEvent> & events,
             }
         }
     }
-    if (not_intervals(events, 1, duration).empty()) {
+    if (raw[1].empty()) {
         return not_fail(error, "No key was decoded; cannot construct a keyed ABC score");
     }
     if (fields[1].empty()) {
@@ -885,9 +919,10 @@ static bool notation_abc(const std::vector<NotEvent> & events,
         return std::tie(a.start, a.end, a.pitch, a.track) < std::tie(b.start, b.end, b.pitch, b.track);
     });
 
-    NotScore s;
-    s.tables = &tables;
-    s.beats  = beats;
+    NotScore & s = *s_out;
+    s            = NotScore{};
+    s.tables     = &tables;
+    s.beats      = beats;
     if (!not_measures(s.beats, &s.measures, error) || !not_grid(&s, error)) {
         return false;
     }
@@ -918,6 +953,52 @@ static bool notation_abc(const std::vector<NotEvent> & events,
     for (const NotInterval & r : fields[2]) {
         int t = not_clampi(not_quantize(r.start, s.subbeat_times), 0, (int) s.subbeat_times.size() - 1);
         s.structure_events.push_back({ t, r.label });
+    }
+
+    // The real-time timeline: raw note and beat times, the intervals in the
+    // song domain rather than clipped to the beat grid
+    if (timeline) {
+        for (const Note & n : clean) {
+            // A note whose rounded span collapses writes no ABC note; leave
+            // it out so the per-track index still counts the voice's notes
+            if (not_midi_round(n.end) > not_midi_round(n.start)) {
+                timeline->notes.push_back({ n.start, n.end, n.pitch, n.track });
+            }
+        }
+        timeline->beats    = beats;
+        timeline->measures = s.measures;
+        timeline->duration = duration;
+        std::vector<NotInterval> * rows[3] = { &timeline->chords, &timeline->keys, &timeline->sections };
+        for (int f = 0; f < 3; f++) {
+            for (NotInterval r : raw[f]) {
+                r.start = std::max(0.0, r.start);
+                r.end   = std::min(duration, r.end);
+                if (f == 1) {
+                    auto it = tables.key_abc.find(r.label);
+                    if (it == tables.key_abc.end()) {
+                        return not_fail(error, "Unsupported key " + r.label);
+                    }
+                    r.label = it->second;
+                }
+                if (r.end > r.start) {
+                    rows[f]->push_back(r);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// The ABC export: the shared score build above, rendered voice by voice
+static bool notation_abc(const std::vector<NotEvent> & events,
+                         double                        duration,
+                         const NotTables &             tables,
+                         bool                          melody_only,
+                         std::string *                 abc,
+                         std::string *                 error) {
+    NotScore s;
+    if (!notation_build(events, duration, tables, melody_only, &s, nullptr, error)) {
+        return false;
     }
     return not_score_to_abc(s, abc, error);
 }
